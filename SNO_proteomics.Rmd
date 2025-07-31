@@ -1,0 +1,522 @@
+---
+title: "Sorafenib Resistance Proteomic Analysis: 
+Differential Abundance & Pathway Enrichment Analysis"
+author: "Miriam Payá-Milans"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+source("functions_sno.R")
+
+# List required packages and install if missing from CRAN/Bioconductor
+
+packages <- c("readxl", "openxlsx", "readr", "tibble", "dplyr", "stringr", "tidyr", 
+              "limma", "clusterProfiler", "ggplot2", "ggvenn", "ggnewscale", "renv")
+package_manager(packages, "install")
+
+# Load required packages
+
+suppressMessages(library(openxlsx))
+suppressMessages(library(readr))
+suppressMessages(library(tibble))
+suppressMessages(library(dplyr))
+suppressMessages(library(stringr))
+suppressMessages(library(tidyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggvenn))
+suppressMessages(library(limma))
+suppressMessages(library(clusterProfiler))
+```
+
+------------------------------------------------------------------------
+
+This protocol has been designed to process proteomics data from S-nitrosylated (SNO) proteins.
+The steps shown here include quantile normalization using a class-specific strategy, useful to preserve biological signals in the normalized dataset, followed by contrast testings to detect differentially abundant SNO proteins between the experimental conditions (cell line and treatment).
+Significant proteins were selected (p \< 0.05) and subjected to KEGG pathway enrichment analysis to explore the biological processes and molecular mechanisms that are potentially being perturbed.
+
+
+# Data Loading and Preprocessing
+
+Proteomics quantification data, including protein annotations and sample metadata, were loaded into the R workspace and restructured into separate data frames.
+
+```{r load-data, echo=FALSE, warning = FALSE, message = FALSE}
+# Set working directory and Read data files
+datadir <- "./data"
+
+f <- "Proteomics_Results.xlsx"
+prot_res <- readxl::read_excel(file.path(datadir, f), .name_repair = "unique_quiet")
+tr_df <- readr::read_tsv(file.path(datadir, "UPacc2EG.tsv"), show_col_types = F)
+
+## Extract Signal intensity as Relative Protein Abundance
+prot_abund <- prot_res %>%
+  dplyr::select(Accession, contains("Area")) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("Accession") %>%
+  dplyr::rename_with(\(x) stringr::str_extract(x, "(^.+):", group = 1))
+
+# remove proteins with >50% zero values (192)
+prot_abund <- prot_abund[rowSums(prot_abund == 0) < ncol(prot_abund)/2,]
+
+## Extract Sample Metadata
+case_info <- Filter(\(x) stringr::str_detect(x, "Area"), colnames(prot_res))
+case_tr <- c(
+  ".*2 control R.*" = "control_untr",
+  ".*2 sorafenib R.*" = "control_sora",
+  ".*2 resistentes R.*" = "resist_untr",
+  ".*2 resistentes sorafenib R.*" = "resist_sora"
+)
+
+case_metadata <- tibble(Sample = stringr::str_extract(case_info, "(^.+):", group = 1),
+                        Condition = stringr::str_replace_all(case_info, case_tr)) %>%
+  tidyr::separate_wider_delim(Condition, "_", cols_remove = F,
+                              names = c("Cell_line", "Treated")) %>%
+  dplyr::mutate(Condition = factor(Condition, levels = case_tr),
+                Cell_line = factor(Cell_line, levels = c("control", "resist")),
+                Treated = factor(Treated, levels = c("untr", "sora")))
+
+## Extract Protein Metadata and Rename columns
+protein_metadata <- prot_res %>%
+  dplyr::mutate(
+    Uniprot_ID = stringr::str_extract(.$Description, "PE.+\\[(.*?)\\]", group = 1),
+    Protein_name = stringr::str_extract(.$Description, "(^.+) OS=", group = 1)
+  ) %>%
+  left_join(dplyr::select(tr_df, from, symbol, gene_id), by = c("Accession" = "from")) %>%
+  dplyr::select(
+    Protein_name,
+    Accession,
+    Uniprot_ID,
+    Gene_id = gene_id,
+    Symbol = symbol,
+    Coverage = `ΣCoverage`,
+    n_Uniq_Pept = `Σ# Unique Peptides`,
+    n_AAs = `# AAs`,
+    MW_kDa = `MW [kDa]`,
+    calc_pI = `calc. pI`
+  ) %>%
+  dplyr::mutate(MW_kDa = round(MW_kDa, 3), calc_pI =  round(calc_pI, 2)) %>%
+  dplyr::distinct() %>% 
+  mutate(Protein_name = str_remove(Protein_name, "^.* similar to "), 
+         Protein_name = str_remove(Protein_name, ", mRNA$"), 
+         Protein_name = str_remove(Protein_name, "Homo sapiens "), 
+         Protein_name = str_remove(Protein_name, " \\(Fragment\\)"))
+```
+
+Sample metadata included the experimental design factors of cell line (parental HepG2 as control or the Sorafenib-resistant line R-HepG2) and treatment (untreated or Sorafenib-treated), organized as follows:
+
+```{r, echo=FALSE}
+case_metadata %>% as.data.frame()
+```
+
+Additionally, protein metadata provided biological and experimental context for each protein, including protein accession ID and name, gene ID and symbol, detected sequence coverage, or number of amino acids, such as:
+
+```{r, echo=FALSE}
+head(protein_metadata, 5) %>% as.data.frame()
+```
+
+Relative protein abundance was derived from the Area values reported by the Proteome Discoverer software, which calculates a total intensity value by summing the ion signal areas of all identified peptides corresponding to each protein.
+
+The protein abundance matrix was structured as a sample × protein table, with samples in columns and proteins (accessions) in rows.
+A fragment of this matrix is shown below:
+
+```{r, echo=FALSE}
+head(prot_abund[,1:7])
+```
+
+Given the variability in quantification depth commonly observed across samples in high-throughput datasets, we next examined the total sample intensity, calculated as the sum of all raw protein intensity values. For instance, large variations between data points were observed, highlighting the need for normalization to reduce variability and improve biological comparisons.
+
+```{r raw-visualization-tot_intens, echo=FALSE}
+# check the column totals (per channel sums)
+prot_abund %>% summarize(across(everything(), \(x){format(sum(x), big.mark = ",")})) %>% 
+  pivot_longer(everything(), names_to = "Sample", values_to = "Raw_intensity") %>% 
+  as.data.frame()
+```
+
+Following data loading and preparation, the dataset was deemed suitable for downstream analyses, including normalization, differential statistical testing, and functional enrichment evaluation using KEGG pathways.
+
+------------------------------------------------------------------------
+
+# Normalization
+
+Class-specific quantile normalization was applied to reduce variability arising from unwanted technical or systematic effects while preserving data consistency and genuine biological signals. In this approach, samples are grouped according to experimental conditions, normalized independently within each group, and then recombined into a unified dataset.
+
+To mitigate the influence of zeros on the log transformation, zero-intensity values were masked before normalization.
+
+```{r, echo=FALSE}
+perc_zero <- sum(prot_abund == 0) / (ncol(prot_abund) * nrow(prot_abund)) * 100
+print(paste("There are", sum(prot_abund == 0), "zero-count values, accounting for the", 
+            sprintf("%0.1f%%", perc_zero), "of total values."))
+```
+
+```{r normalization, echo=FALSE}
+## Data Normalization
+# 1. Replace zeros with NA and Apply log2 transformation
+log2_data <- prot_abund
+log2_data[log2_data == 0] <- NA
+log2_data <- log2(log2_data)
+
+# 2. Class-specific quantile normalization (https://doi.org/10.1038/s41598-020-72664-6)
+conditions <- unique(case_metadata$Condition)
+norm_list <- list()
+for (cond in conditions) {
+  cond_samples <- case_metadata %>% filter(Condition == cond) %>% pull(Sample)
+  sub_data <- log2_data[, cond_samples, drop = FALSE]
+  norm_data <- normalizeBetweenArrays(sub_data, method = "quantile")
+  norm_list[[cond]] <- norm_data
+}
+norm_class_quantile <- do.call(cbind, norm_list) %>% as.data.frame()
+```
+
+After data normalization, log-transformed and normalized data were visualized jointly.
+
+```{r normdata-visualization, echo=FALSE}
+## Wrangling of Normalized values for visualization
+# Combine all datasets into a long-format dataframe
+preplot_data <- bind_rows(
+  log2_data %>%
+    tibble::rownames_to_column("Accession") %>%
+    tidyr::pivot_longer(-Accession, names_to = "Sample", values_to = "Area") %>%
+    dplyr::mutate(Method = "Raw (log2)"),
+
+  norm_class_quantile %>%
+    tibble::rownames_to_column("Accession") %>%
+    tidyr::pivot_longer(-Accession, names_to = "Sample", values_to = "Area") %>%
+    dplyr::mutate(Method = "Class-sp Quantile")
+)
+
+# clean NA values and Add sample condition metadata
+plot_data <- preplot_data %>%
+  dplyr::filter(!is.na(Area)) %>%
+  dplyr::mutate(Method = factor(Method,
+                                levels = unique(preplot_data$Method))) %>%
+  dplyr::left_join(case_metadata, by = "Sample") %>%
+  dplyr::left_join(protein_metadata, by = "Accession") %>%
+  dplyr::mutate(avg = mean(Area), .by = c("Method", "Condition"))
+```
+
+In the following distribution plots, the X markers indicate the mean intensity per sample.
+Class-specific quantile normalization aligns sample distributions by group (condition) to the same median value.
+
+```{r norm-violin-samp, echo=FALSE, fig.width=6, fig.height=6, warning=FALSE}
+# Violin plots of samples faceted by method
+plot_violin_box(plot_data, xvar = Sample, yvar = Area, fill_var = Condition, 
+                facet_var = "Method", axis_scale = "free_y", 
+                title = "Normalization comparison by Sample")
+```
+
+The density plots show how the class-specific strategy clearly retains group-specific patterns reflecting the raw biological variability.
+
+
+```{r norm-dens-samp, echo=FALSE, fig.width=6, fig.height=5}
+# Density plots of Samples faceted by method
+plot_density(plot_data, Area, group_var = Sample, color_var = Condition, 
+             facet_var = "Method", axis_scale = "free_x", 
+             title = "Density plots of Samples colored by Condition")
+```
+
+When visualizing individual protein intensities, the class-specific normalization strategy retains differences in group means observed in the unnormalized data, potentially preserving meaningful biological variation.
+
+```{r norm-violin-prot, echo=FALSE, fig.width=7, fig.height=5}
+# Violin plots of Proteins faceted by method
+n_prot <- 25
+p <- plot_violin_box(plot_data, xvar = Accession, yvar = Area, 
+                     max_terms = n_prot, facet_var = "Method", 
+                     title = "Intensity of Protein Accessions across samples")
+p <- p + geom_point(aes(y = avg, color = Condition), shape = 23, stroke = 1, size = .5) + 
+  labs(color = "Mean Intensity\nby Condition")
+p
+```
+
+PCA plots of the proteomic dataset before and after normalization show the distribution of samples according to cell line and treatment. Visual inspection suggests that class-specific quantile normalization improves sample clustering, with clearer separation between experimental conditions, indicating reduced technical variability and better preservation of biological signal.
+
+```{r norm-pca, echo=FALSE, fig.width=6, fig.height=4}
+# PCA plots faceted by method
+
+run_plot_pca(plot_data, run_by = "Method", plot_group = Condition,
+             title = "PCA of SNO dataset; raw (log2) and normalized data.")
+```
+
+------------------------------------------------------------------------
+
+# Differential Protein Abundance Analysis with Limma
+
+After normalization, differential abundance analysis was performed using the limma package, which fits a linear model to each protein and tests the specified contrasts. In this study, all pairwise combinations between the four experimental conditions (defined by cell line and treatment) were included as contrasts. The results were filtered using a p-value threshold of < 0.05, and protein metadata were integrated to facilitate biological interpretation.
+
+```{r limma-analysis, echo=FALSE, warning=FALSE}
+# Run automatically-designed contrasts on limma; add protein annotations
+limma_results <- fit_contrasts(norm_class_quantile, case_metadata$Condition) %>% 
+  dplyr::left_join(protein_metadata, by = "Accession")
+
+# soft filtering by p.value < 0.05; calculate combined score
+pval <- 0.05
+limma_results_sig <- limma_results %>%
+  dplyr::filter(P.Value < pval) %>%
+  dplyr::mutate(n_contrast = length(Contrast), .by = Accession, ) %>%
+  dplyr::mutate(abs_Change = abs(t) , 
+                log10_pvalue = -log10(P.Value),
+                CombinedScore = abs(t)*log10_pvalue*n_contrast*Coverage*MW_kDa)
+```
+
+Below is a sample of the intermediate results.
+
+```{r diff-inspect1, echo=FALSE}
+# Save or inspect
+head(limma_results_sig)[-3,]
+```
+
+The number of differentially abundant proteins (p-value < 0.05) varied widely across contrasts, with those involving control_sora consistently yielding approximately twice as many significant proteins as the others. Multiple testing correction (adjusted p-value < 0.05) greatly reduced the number of hits, leading to the use of unadjusted p-values for selecting significant proteins.
+
+
+```{r diff-inspect2, echo=FALSE}
+limma_results_sig %>%
+  summarize(n_sig = n(),
+            n_adj = sum(adj.P.Val < 0.05, na.rm = T),
+            .by = "Contrast")
+```
+
+Before protein-detailed visualization of the overall results and to prioritize biologically relevant candidates, a composite Combined Score was calculated for each protein, integrating effect size (t-statistic), p-value and the number of contrasts in which the protein was significant, as well as basic protein features (coverage, molecular weight):
+
+`CombinedScore = abs(t) × log10(p-value) × n_contrast × Coverage × MW_kDa`
+
+This score was used to sort proteins in those visualizations that include several contrasts, highlighting those of relevance. Here, color scale indicates Fold Change, while size is proportional to p-value significance.
+
+```{r diffres-balloon, echo=FALSE, fig.width=6, fig.height=6.5}
+## Visualization of significant results
+# Balloon plot of Proteins vs Contrasts
+max_terms <- 20
+
+# get the balloon plot for limma results
+p <- plot_balloon(limma_results_sig, xvar = Contrast, yvar = Accession, 
+                  max_y = max_terms, color_var = logFC, size_var = log10_pvalue, 
+                  size_lab = "-log10(p)", sort_var = "CombinedScore", 
+                  prefix = "limma", p_type = "P.Value", pval = pval, ylab = "Protein", 
+                  title = "Differential Abundance Balloon Plot (p<0.05)")
+# alter the balloon plot for limma results to add annotations
+p <- p +
+  theme(axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+# select row annotation data to plot
+annotation_data <- protein_metadata %>%
+  dplyr::select(Accession, calc_pI, MW_kDa) %>%
+  dplyr::filter(Accession %in% p$data$Accession) %>% 
+  dplyr::mutate(Accession = factor(Accession, levels = rev(unique(p$data$Accession)))) %>% 
+  tidyr::pivot_longer(cols = c(calc_pI, MW_kDa), names_to = "Feature", values_to = "Value")
+
+m1 <- annotation_data %>% 
+  dplyr::filter(Feature == "calc_pI")
+m2 <- annotation_data %>% 
+  dplyr::filter(Feature == "MW_kDa")
+
+# plot annotation columns with 2 color scales
+p_annot <-ggplot(mapping = aes(x = Feature, y = Accession)) +
+  # This bit is for making scales
+  geom_tile(data=m1, aes(fill = Value)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 7) +
+  guides(fill = guide_legend(title="calc_pI")) +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data=m2, aes(fill=Value)) +
+  scale_fill_gradient(low = "white", high = "black") + 
+  guides(fill = guide_legend(title="MW_kDa")) +
+  theme_minimal() +
+  labs(y = "Protein") + 
+  scale_x_discrete(position = "top") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 0),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(),
+        legend.position = "top", 
+        legend.box = "vertical", 
+        legend.key.spacing = unit(0.1, 'cm'),
+        legend.spacing = unit(0, 'cm'), 
+        legend.key.size = unit(0.5, 'cm'))
+
+# combine plots
+p_annot + p + patchwork::plot_layout(widths = c(0.2, 1))
+```
+
+These results show strong candidates like ENPP1 (ectonucleotide pyrophosphatase/phosphodiesterase 1), peptidylprolyl isomerase, and fatty acid synthase, all of which have been implicated in cancer biology, stress responses, or redox regulation.
+The corresponding list of proteins is the following:
+
+```{r max-sig, echo=FALSE}
+top_ids <- get_top_ids(limma_results_sig, "Accession", max_terms, p_type = "P.Value") %>% 
+  dplyr::select(Protein_name, Accession) %>% 
+  distinct() %>% 
+  mutate(Protein_name = str_trunc(Protein_name, 62, "right", ""))
+
+
+data.frame(top_ids)
+```
+
+
+------------------------------------------------------------------------
+
+# KEGG Pathway Enrichment with ClusterProfiler
+
+To investigate the functional implications of the observed proteomic alterations, KEGG pathway enrichment analysis was performed using ClusterProfiler.
+Enrichment was assessed using the full list of genes in the KEGG database as background.
+
+```{r clusterProfiler, echo=FALSE, message=FALSE, warning=FALSE}
+# Extract significant proteins
+contrast_list <- unique(limma_results_sig$Contrast)
+sig_prot <- list()
+for (c in contrast_list) {
+  sig_prot[[c]] <- limma_results_sig %>% dplyr::filter(Contrast == c) %>% pull(Accession)
+}
+
+# Extract significant genes and apply KEGG GSEA
+
+kk <- list()
+for (contrast_name in contrast_list) {
+  # Extract significant genes for this contrast
+  contrast_genes <- protein_metadata %>%
+    dplyr::filter(Accession %in% sig_prot[[contrast_name]]) %>%
+    dplyr::pull(Gene_id) %>% na.omit() %>% unique()
+  
+  # Run enrichment with whole universe
+  kk[[contrast_name]] <- enrichKEGG(gene = contrast_genes,
+                                        organism = "hsa",
+                                        pvalueCutoff = 0.05)
+}
+
+# Extract and bind the resulting outputs
+keggres <- lapply(seq_along(contrast_list), function(i) {
+  kk[[i]]@result %>%
+    dplyr::mutate(Contrast = contrast_list[i], .before = 1)
+}) %>% 
+  dplyr::bind_rows(.) %>%
+  dplyr::mutate(symbolID = purrr::map_chr(geneID, mapIDs, map_df = protein_metadata),
+                Accession = purrr::map_chr(geneID, mapAcc, map_df = protein_metadata)) %>%
+  dplyr::mutate(n_contrast = sum(pvalue < 0.05), .by = Description) %>% 
+  dplyr::mutate(log10_pvalue = round(-log10(pvalue), 3),
+                CombinedScore = FoldEnrichment * log10_pvalue * zScore * n_contrast)
+```
+
+The table below summarizes the number of significantly enriched pathways (p \< 0.05) detected for each comparison. 
+
+```{r kegg-inspect, echo=FALSE}
+keggres %>%
+  summarize(n_sig = sum(pvalue < 0.05, na.rm = T), 
+            n_adj = sum(p.adjust < 0.05, na.rm = T), .by = "Contrast")
+```
+
+On the next figure, the most significantly enriched pathways (by adjusted p-value) are displayed along with the contrasts that support such enrichment. Notably, Biosynthesis of amino acids is consistently enriched.
+
+```{R gsea-visualization1, echo=FALSE, fig.width=6, fig.height=4}
+# Balloon plot: by p-adjust < 0.05
+plot_balloon(keggres, xvar = Contrast, yvar = Description, 
+             size_var = Count, color_var = FoldEnrichment,
+             p_type = "p.adjust", sort_var = "CombinedScore", ylab = "KEGG Pathway", 
+             title = "KEGG Enrichment on significant genes (p.adjust)")
+```
+
+
+We may also visualize the genes that are responsible for the enrichment of these pathways.
+
+```{R gsea-visualization2, echo=FALSE, fig.width=9, fig.height=4}
+# Balloon plot: kegg vs prot, by p-adjust < 0.05
+keggres_gene <- keggres %>% 
+  dplyr::filter(p.adjust < 0.05) %>% 
+  separate_longer_delim(symbolID, "/") %>% 
+  dplyr::filter(symbolID != "NA") %>% 
+  dplyr::mutate(n_contrast = n(), .by = c("Description", "symbolID"))
+plot_balloon(keggres_gene, xvar = symbolID, yvar = Description, 
+             size_var = n_contrast, color_var = FoldEnrichment, p_type = "p.adjust", 
+             xlab = "Gene Symbol", ylab = "KEGG Pathway", sort_var = "CombinedScore", 
+             title = "KEGG Enrichment across contrasts with participating genes")
+```
+
+Filtering results by unadjusted p-value yielded a substantially larger set of enriched pathways. To focus on more physiologically relevant insights, disease-related pathways were excluded from the following visualization, and a display limit was applied to the number of pathways shown.
+
+
+```{R gsea-visualization3, echo=FALSE, fig.width=6.5, fig.height=6}
+# Balloon plot: by p-value < 0.05
+max_terms <- 30
+plot_balloon(keggres %>% dplyr::filter(!str_detect(category, "Disease")), 
+             xvar = Contrast, yvar = Description, ylab = "KEGG Pathway", 
+             max_y = max_terms, size_var = Count, color_var = FoldEnrichment,
+             p_type = "pvalue", sort_var = "CombinedScore", 
+             title = "KEGG Enrichment on significant genes (pvalue)")
+```
+  
+To finalize, KEGG pathway enrichment was examined in two specific contrasts. In the resulting plots, color (red/blue) represents the direction of the limma differential abundance fold change (FC), while the shape encodes a combination of differential abundance (FC) and KEGG fold enrichment (FE). Since FE values are always positive, the shift in shape size primarily reflects the direction and magnitude of the FC.
+
+
+```{R gsea-csvscu, echo=FALSE, fig.width=8, fig.height=6}
+# Balloon plot: C_sora vs C_untr, kegg vs prot, by pvalue < 0.05
+csvscu <- "control_sora-control_untr"
+keggres_csvscu <- keggres %>% 
+  dplyr::filter(Contrast == csvscu, pvalue < 0.05) %>% 
+  separate_longer_delim(cols = c(geneID, symbolID, Accession), delim = "/") %>% 
+  dplyr::filter(symbolID != "NA") %>% 
+  inner_join(dplyr::filter(limma_results_sig, Contrast == csvscu)[,1:4], by = "Accession") %>% 
+  mutate(symbolID = factor(symbolID, levels = unique(.$symbolID)), 
+         FCxFE = logFC * FoldEnrichment, 
+         sortScore = FoldEnrichment * log10_pvalue * zScore)
+plot_balloon(keggres_csvscu, xvar = symbolID, yvar = Description, 
+             size_var = FCxFE, color_var = logFC, sort_var = "sortScore", 
+             p_type = "pvalue", xlab = "Gene Symbol", ylab = "KEGG Pathway", 
+             title = "KEGG Enrichment on control cells")
+```
+
+In this case, the negative of FC was used to emphasize the negatively regulated proteins.
+
+```{R gsea-rsvscs, echo=FALSE, fig.width=8, fig.height=6}
+# Balloon plot: R_sora vs C_sora, kegg vs prot, by pvalue < 0.05
+rsvscs <- "resist_sora-control_sora"
+keggres_rsvscs <- keggres %>% 
+  dplyr::filter(Contrast == rsvscs, pvalue < 0.05) %>% 
+  separate_longer_delim(cols = c(geneID, symbolID, Accession), delim = "/") %>% 
+  dplyr::filter(symbolID != "NA") %>% 
+  inner_join(dplyr::filter(limma_results_sig, Contrast == rsvscs)[,1:4], by = "Accession") %>% 
+  mutate(symbolID = factor(symbolID, levels = unique(.$symbolID)), 
+         FCxFE3 = -logFC * FoldEnrichment, 
+         sortScore = FoldEnrichment * log10_pvalue * zScore)
+plot_balloon(keggres_rsvscs, xvar = symbolID, yvar = Description, 
+             size_var = FCxFE3, size_lab = "-FCxFE", 
+             color_var = logFC, sort_var = "sortScore", 
+             p_type = "pvalue", xlab = "Gene Symbol", ylab = "KEGG Pathway", 
+             title = "KEGG Enrichment on Sorafenib-treated cells")
+```
+
+A shared set of pathways appears counterbalanced between the two contrasts, as their constituent proteins primarily display opposite fold change directions in each comparison:
+
+```{r echo=FALSE}
+
+ctrl_path <- keggres_csvscu %>% 
+  dplyr::filter(!str_detect(category, "Disease")) %>% 
+  pull(Description) %>% unique() %>% as.character()
+resist_path <- keggres_rsvscs %>% 
+  dplyr::filter(!str_detect(category, "Disease")) %>% 
+  pull(Description) %>% unique() %>% as.character()
+
+intersect(ctrl_path, resist_path)
+
+```
+
+Likewise, eight shared proteins exhibit opposite regulation between the two contrasts, highlighting potential key modulators of the differential response:
+
+```{r echo=FALSE}
+
+# extract genes, not disease-related and by opposing logFC
+ctrl_gene <- keggres_csvscu %>% 
+  dplyr::filter(!str_detect(category, "Disease"), logFC > 0) %>% 
+  pull(symbolID) %>% unique() %>% as.character()
+resist_gene <- keggres_rsvscs %>% 
+  dplyr::filter(!str_detect(category, "Disease"), logFC < 0) %>% 
+  pull(symbolID) %>% unique() %>% as.character()
+
+common_genes <- intersect(ctrl_gene, resist_gene)
+protnames <- protein_metadata$Protein_name[match(intersect(ctrl_gene, resist_gene), protein_metadata$Symbol)]
+names(protnames) <- common_genes
+protnames <- sort(protnames)
+
+mapply(function(name, gene) sprintf("%s (%s)", name, gene), 
+       protnames, names(protnames), USE.NAMES = FALSE)
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
