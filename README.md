@@ -19,7 +19,7 @@ The main components of the analysis include:
 * `SNO_proteomics.R` — R script used to run the pipeline and generate figures and tables separately.
 * `functions_sno.R` — Custom helper functions used in the analysis.
 * `SNO_proteomics.Rproj` — RStudio project file for convenient setup.
-* `data/`` — Folder containing input data (proteomics results, translation table).
+* `data/` — Folder containing input data (proteomics results, translation table).
 * `README.md` — This description of the project and usage.
 
 ## Reproducibility
